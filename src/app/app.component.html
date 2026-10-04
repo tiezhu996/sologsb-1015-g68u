@@ -1,0 +1,320 @@
+<div class="poem-shell">
+  <header class="app-header">
+    <div class="brand-block">
+      <div class="seal">律</div>
+      <div>
+        <span class="overline">CLASSICAL POETRY WORKBENCH</span>
+        <h1>{{ store.workspace().title }} · 格律校勘台</h1>
+      </div>
+    </div>
+    <div class="header-status">
+      <nz-tag nzColor="cyan">{{ store.template().name }}</nz-tag>
+      <span class="status-copy">{{ store.activeVersion().name }}</span>
+      <nz-progress
+        class="tiny-progress"
+        [nzPercent]="checkedRate"
+        [nzShowInfo]="false"
+        nzStrokeColor="#3f7c6c"
+        [nzStrokeWidth]="6"
+      ></nz-progress>
+      <span class="status-copy">已标注 {{ checkedRate }}%</span>
+    </div>
+    <div class="header-actions">
+      <button nz-button nz-tooltip nzTooltipTitle="撤销 Ctrl/Cmd+Z" [disabled]="store.undoCount() === 0" (click)="store.undo()">撤销</button>
+      <button nz-button nz-tooltip nzTooltipTitle="重做 Ctrl/Cmd+Y" [disabled]="store.redoCount() === 0" (click)="store.redo()">重做</button>
+      <button nz-button nzType="primary" (click)="store.snapshot()">保存校勘稿</button>
+    </div>
+  </header>
+
+  <section class="workspace-banner">
+    <div class="poem-meta">
+      <label>篇名</label>
+      <input nz-input [ngModel]="store.workspace().title" (ngModelChange)="store.updateTitle($event)" />
+      <label>作者</label>
+      <span>{{ store.workspace().author }}</span>
+    </div>
+    <nz-select class="template-select" [ngModel]="store.workspace().templateId" (ngModelChange)="store.setTemplate($event)">
+      @for (template of templates; track template.id) {
+        <nz-option [nzValue]="template.id" [nzLabel]="template.name"></nz-option>
+      }
+    </nz-select>
+    <div class="issue-pills">
+      <nz-tag nzColor="error">{{ totalErrors }} 处出律</nz-tag>
+      <nz-tag nzColor="warning">{{ totalWarnings }} 处待核</nz-tag>
+      <nz-tag>{{ store.differences().length }} 处异文</nz-tag>
+    </div>
+  </section>
+
+  <nz-tabset nzType="line" class="main-tabs">
+    <nz-tab nzTitle="逐字标注">
+      <div class="meter-workbench">
+        <aside class="source-panel surface">
+          <div class="section-title">
+            <div>
+              <span class="overline">TEXT SOURCE</span>
+              <h2>诗句文本</h2>
+            </div>
+            <nz-tag>{{ store.activeVersion().source }}</nz-tag>
+          </div>
+          <textarea
+            nz-input
+            class="poem-textarea"
+            rows="12"
+            [ngModel]="store.activeVersion().text"
+            (ngModelChange)="store.updateText($event)"
+          ></textarea>
+          <div class="version-note">
+            <span>当前版本</span>
+            <strong>{{ store.activeVersion().name }}</strong>
+            <small>所有编辑自动写入浏览器本地</small>
+          </div>
+          <nz-divider></nz-divider>
+          <div class="keyboard-map">
+            <span class="overline">键盘巡校</span>
+            <p><kbd>↑↓←→</kbd> 移动定字</p>
+            <p><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> 平 / 仄 / 中</p>
+            <p><kbd>R</kbd> 切换韵组　<kbd>Space</kbd> 停顿</p>
+          </div>
+        </aside>
+
+        <main class="meter-panel surface">
+          <div class="section-title">
+            <div>
+              <span class="overline">METER GRID</span>
+              <h2>逐字格律标注</h2>
+            </div>
+            <div class="legend">
+              <span class="legend-dot correct"></span>合律
+              <span class="legend-dot variant"></span>可接受
+              <span class="legend-dot error"></span>出律
+              <span class="legend-dot unknown"></span>待标
+            </div>
+          </div>
+          <div class="meter-lines">
+            @for (line of store.analysis(); track line.index) {
+              <article class="meter-line" [class.is-rhyme-line]="store.template().rhymeLines.includes(line.index)">
+                <div class="line-label">
+                  <strong>第 {{ line.index + 1 }} 句</strong>
+                  <small>{{ line.errors }} 出律 · {{ line.variants }} 变体</small>
+                </div>
+                <div class="character-row">
+                  @for (cell of line.cells; track cell.position) {
+                    <button
+                      class="meter-character"
+                      [class.is-selected]="store.selectedLine() === line.index && store.selectedPosition() === cell.position"
+                      [class.is-correct]="cell.status === 'correct'"
+                      [class.is-variant]="cell.status === 'variant'"
+                      [class.is-error]="cell.status === 'error'"
+                      [class.is-unknown]="cell.status === 'unknown'"
+                      nz-tooltip
+                      [nzTooltipTitle]="cell.message"
+                      (click)="store.selectCell(line.index, cell.position)"
+                    >
+                      <span class="expected">{{ cell.expected }}／{{ cell.actual }}</span>
+                      <span class="hanzi">{{ cell.char }}</span>
+                      <span class="mark-row">
+                        @if (cell.mark.rhyme) { <em>{{ cell.mark.rhyme }}</em> }
+                        @if (cell.mark.pauseAfter) { <i>顿</i> }
+                      </span>
+                    </button>
+                  }
+                </div>
+                @if (store.template().rhymeLines.includes(line.index)) {
+                  <nz-tag nzColor="green">韵脚</nz-tag>
+                }
+              </article>
+            }
+          </div>
+          <div class="meter-footer">
+            <span>模板：{{ store.template().summary }}</span>
+            <span>一三五位置可判为可接受变体；韵脚重复单独提示。</span>
+          </div>
+        </main>
+
+        <aside class="inspector-panel surface">
+          <div class="section-title compact">
+            <div>
+              <span class="overline">MARK INSPECTOR</span>
+              <h2>字音判断依据</h2>
+            </div>
+          </div>
+          @if (selectedCell(); as cell) {
+            <div class="selected-char-card">
+              <span class="large-hanzi">{{ cell.char }}</span>
+              <div>
+                <strong>第 {{ store.selectedLine() + 1 }} 句 · 第 {{ cell.position + 1 }} 字</strong>
+                <p>{{ cell.message }}</p>
+              </div>
+            </div>
+            <label class="field-label">平仄</label>
+            <div class="tone-buttons">
+              <button nz-button [nzType]="cell.mark.tone === '平' ? 'primary' : 'default'" (click)="setTone('平')">平</button>
+              <button nz-button [nzType]="cell.mark.tone === '仄' ? 'primary' : 'default'" (click)="setTone('仄')">仄</button>
+              <button nz-button [nzType]="cell.mark.tone === '中' ? 'primary' : 'default'" (click)="setTone('中')">中</button>
+              <button nz-button [nzType]="cell.mark.tone === '?' ? 'primary' : 'default'" (click)="setTone('?')">待定</button>
+            </div>
+            <label class="field-label">停顿</label>
+            <div class="switch-line">
+              <nz-switch [ngModel]="cell.mark.pauseAfter" (ngModelChange)="store.setMark({ pauseAfter: $event })"></nz-switch>
+              <span>此字后标记停顿</span>
+            </div>
+            <label class="field-label">韵组</label>
+            <input nz-input placeholder="如 A、下平八庚" [ngModel]="cell.mark.rhyme" (ngModelChange)="store.setMark({ rhyme: $event })" />
+            <label class="field-label">判断依据</label>
+            <textarea
+              nz-input
+              rows="3"
+              placeholder="韵书、异文或音义依据"
+              [ngModel]="cell.mark.basis"
+              (ngModelChange)="updateSource($event)"
+            ></textarea>
+            <label class="field-label">批注</label>
+            <textarea
+              nz-input
+              rows="3"
+              placeholder="记录校勘判断"
+              [ngModel]="cell.mark.note"
+              (ngModelChange)="store.setMark({ note: $event })"
+            ></textarea>
+            <nz-divider></nz-divider>
+            <button nz-button nzBlock (click)="store.addAntithesis()">将此句加入对仗关系</button>
+          } @else {
+            <nz-empty nzNotFoundContent="请选择某个字"></nz-empty>
+          }
+        </aside>
+      </div>
+    </nz-tab>
+
+    <nz-tab nzTitle="格律与对仗">
+      <div class="audit-layout">
+        <section class="surface audit-main">
+          <div class="section-title">
+            <div><span class="overline">METER AUDIT</span><h2>检查结果</h2></div>
+            <nz-tag nzColor="processing">{{ store.issues().length }} 条记录</nz-tag>
+          </div>
+          <div class="issue-list">
+            @for (issue of store.issues(); track issue.id) {
+              <button
+                class="issue-row"
+                [class.level-error]="issue.level === 'error'"
+                [class.level-warning]="issue.level === 'warning'"
+                [class.level-info]="issue.level === 'info'"
+                (click)="issue.line !== undefined && store.selectCell(issue.line, issue.position || 0)"
+              >
+                <span class="issue-symbol">{{ issue.level === 'error' ? '出' : issue.level === 'warning' ? '核' : '合' }}</span>
+                <span><strong>{{ issue.title }}</strong><small>{{ issue.detail }}</small></span>
+                @if (issue.line !== undefined) { <em>定位第 {{ issue.line + 1 }} 句</em> }
+              </button>
+            }
+          </div>
+        </section>
+        <section class="surface antithesis-panel">
+          <div class="section-title">
+            <div><span class="overline">PARALLELISM</span><h2>对仗关系</h2></div>
+            <button nz-button nzType="primary" (click)="store.addAntithesis()">添加对仗</button>
+          </div>
+          @if (store.activeVersion().antithesisPairs.length === 0) {
+            <nz-empty nzNotFoundContent="尚未建立对仗关系"></nz-empty>
+          }
+          <div class="pair-list">
+            @for (pair of store.activeVersion().antithesisPairs; track pair.id) {
+              <article class="pair-card">
+                <div class="pair-head">
+                  <strong>第 {{ pair.leftLine + 1 }} 句 ↔ 第 {{ pair.rightLine + 1 }} 句</strong>
+                  <button nz-button nzType="text" nzDanger (click)="store.removeAntithesis(pair.id)">移除</button>
+                </div>
+                <p>{{ store.lines()[pair.leftLine] }}</p>
+                <p>{{ store.lines()[pair.rightLine] }}</p>
+                <input nz-input [ngModel]="pair.note" (ngModelChange)="store.updateAntithesis(pair.id, $event)" />
+              </article>
+            }
+          </div>
+        </section>
+      </div>
+    </nz-tab>
+
+    <nz-tab nzTitle="异文并排比较">
+      <section class="surface compare-panel">
+        <div class="compare-toolbar">
+          <div>
+            <span class="overline">TEXTUAL VARIANTS</span>
+            <h2>逐字异文定位</h2>
+          </div>
+          <nz-select
+            class="version-select"
+            nzPlaceHolder="选择比较底本"
+            [ngModel]="store.baselineVersionId()"
+            (ngModelChange)="store.baselineVersionId.set($event)"
+          >
+            @for (version of store.workspace().versions; track version.id) {
+              <nz-option [nzValue]="version.id" [nzLabel]="version.name"></nz-option>
+            }
+          </nz-select>
+          <button nz-button (click)="store.previousDifference()">上一处异文</button>
+          <button nz-button nzType="primary" (click)="store.nextDifference()">下一处异文</button>
+          <nz-tag nzColor="error">{{ store.differences().length }} 处差异</nz-tag>
+        </div>
+        @if (store.baselineVersion(); as baseline) {
+          <div class="compare-headings">
+            <div><span>底本</span><strong>{{ baseline.name }}</strong><small>{{ baseline.source }}</small></div>
+            <div><span>当前校勘稿</span><strong>{{ store.activeVersion().name }}</strong><small>{{ store.activeVersion().source }}</small></div>
+          </div>
+          <div class="compare-text">
+            @for (item of store.diff(); track item.index) {
+              <span
+                class="diff-char"
+                [class.is-changed]="item.changed"
+                [class.is-current]="item.index === store.currentDiffIndex()"
+                [class.has-left]="!item.left"
+                [class.has-right]="!item.right"
+              >
+                <i>{{ item.left || '□' }}</i>
+                <b>{{ item.right || '□' }}</b>
+              </span>
+            }
+          </div>
+          <div class="compare-note">
+            <nz-alert nzType="info" nzShowIcon nzMessage="比较采用字符位置对齐" nzDescription="上方为上／底本字符，下方为当前版本。点击“下一处异文”可逐项定位。"></nz-alert>
+          </div>
+        } @else {
+          <nz-empty nzNotFoundContent="请选择一份异文底本"></nz-empty>
+        }
+      </section>
+    </nz-tab>
+
+    <nz-tab nzTitle="版本与导出">
+      <div class="version-layout">
+        <section class="surface version-cards">
+          <div class="section-title">
+            <div><span class="overline">VERSIONS</span><h2>校勘版本</h2></div>
+            <button nz-button (click)="store.duplicateActiveAsBaseline()">以当前版本为比较底本</button>
+          </div>
+          <div class="version-grid">
+            @for (version of store.workspace().versions; track version.id) {
+              <button class="version-card" [class.is-active]="version.id === store.workspace().activeVersionId" (click)="store.selectVersion(version.id)">
+                <span class="version-mark">{{ version.name.slice(0, 1) }}</span>
+                <strong>{{ version.name }}</strong>
+                <small>{{ version.source }}</small>
+                <p>{{ version.text.replace('\n', ' / ') }}</p>
+                <em>{{ version.createdAt | date: 'yyyy-MM-dd HH:mm' }}</em>
+              </button>
+            }
+          </div>
+        </section>
+        <aside class="surface export-panel">
+          <span class="overline">PROOFREAD EXPORT</span>
+          <h2>导出校对稿</h2>
+          <p>包含逐字平仄、韵组、判断依据、出律提示与对仗记录。</p>
+          <button nz-button nzType="primary" nzSize="large" nzBlock (click)="store.downloadProofreadCopy()">导出 Markdown 校对稿</button>
+          <nz-divider></nz-divider>
+          <label class="field-label">当前底本说明</label>
+          <input nz-input [ngModel]="store.activeVersion().source" (ngModelChange)="updateVersionSource($event)" />
+        </aside>
+      </div>
+    </nz-tab>
+  </nz-tabset>
+
+  @if (store.toast(); as message) {
+    <div class="toast">{{ message }}</div>
+  }
+</div>
