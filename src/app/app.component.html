@@ -12,12 +12,12 @@
       <span class="status-copy">{{ store.activeVersion().name }}</span>
       <nz-progress
         class="tiny-progress"
-        [nzPercent]="checkedRate"
+        [nzPercent]="checkedRate()"
         [nzShowInfo]="false"
         nzStrokeColor="#3f7c6c"
         [nzStrokeWidth]="6"
       ></nz-progress>
-      <span class="status-copy">已标注 {{ checkedRate }}%</span>
+      <span class="status-copy">已标注 {{ checkedRate() }}%</span>
     </div>
     <div class="header-actions">
       <button nz-button nz-tooltip nzTooltipTitle="撤销 Ctrl/Cmd+Z" [disabled]="store.undoCount() === 0" (click)="store.undo()">撤销</button>
@@ -39,19 +39,69 @@
       }
     </nz-select>
     <div class="issue-pills">
-      <nz-tag nzColor="error">{{ totalErrors }} 处出律</nz-tag>
-      <nz-tag nzColor="warning">{{ totalWarnings }} 处待核</nz-tag>
+      @if (stale()) {
+        <nz-tag nzColor="warning">结论为旧版，待新批次确认</nz-tag>
+      }
+      <nz-tag nzColor="error">{{ totalErrors() }} 处出律</nz-tag>
+      <nz-tag nzColor="warning">{{ totalWarnings() }} 处待核</nz-tag>
       <nz-tag>{{ store.differences().length }} 处异文</nz-tag>
     </div>
   </section>
 
+  <!-- 后台分析批次状态：与正文编辑会话分离，输入和批注不被阻断 -->
+  @if (runState()?.phase === 'queued' || runState()?.phase === 'running') {
+    <nz-alert
+      class="batch-banner"
+      nzType="info"
+      nzShowIcon
+      [nzMessage]="runState()?.phase === 'queued' ? '正文已改动，分析批次静默排队中' : '后台按批次分析中'"
+      [nzDescription]="batchDescTpl"
+    ></nz-alert>
+    <ng-template #batchDescTpl>
+      <span class="batch-desc">
+        正在分析第 {{ batchPercent() }}%（{{ batchDoneLines() }}/{{ batchTotalLines() }} 句，{{ runState()?.resumed ? '从检查点继续' : '新批次' }}）。
+        字格与异文仍显示上一版已确认结果，可继续输入与批注；每次改动都会让在跑批次作废重排。
+        <nz-progress [nzPercent]="batchPercent()" [nzShowInfo]="false" nzSize="small"></nz-progress>
+      </span>
+    </ng-template>
+  } @else if (runState()?.phase === 'failed') {
+    <nz-alert
+      class="batch-banner"
+      nzType="error"
+      nzShowIcon
+      nzMessage="后台分析批次失败，已回退到上一版完整结果"
+      [nzDescription]="batchFailTpl"
+    ></nz-alert>
+    <ng-template #batchFailTpl>
+      <span class="batch-desc">
+        {{ runState()?.lastError }}。断点已保留，未完成段落显示“待分析”，旧结论不作冒充。
+        <button nz-button nzSize="small" nzType="primary" (click)="store.resumeAnalysis()">从检查点继续</button>
+      </span>
+    </ng-template>
+  } @else if (runState()?.phase === 'complete') {
+    <nz-alert
+      class="batch-banner compact"
+      nzType="success"
+      nzShowIcon
+      [nzMessage]="'分析版本 ' + confirmedRevision() + ' 已整版确认' + (stale() ? '（当前正文有改动，等待新批次）' : '')"
+    ></nz-alert>
+  }
+
   <nz-tabset nzType="line" class="main-tabs">
-    <nz-tab nzTitle="逐字标注">
+    <nz-tab [nzTitle]="meterTabTitle">
+      <ng-template #meterTabTitle>
+        逐字标注
+        @if (runState()?.phase === 'running' || runState()?.phase === 'queued') {
+          <span class="tab-dot running" [title]="'批次进度 ' + batchPercent() + '%'"></span>
+        } @else if (runState()?.phase === 'failed') {
+          <span class="tab-dot failed" title="批次失败，可从检查点继续"></span>
+        }
+      </ng-template>
       <div class="meter-workbench">
         <aside class="source-panel surface">
           <div class="section-title">
             <div>
-              <span class="overline">TEXT SOURCE</span>
+              <span class="overline">TEXT SOURCE · 编辑会话</span>
               <h2>诗句文本</h2>
             </div>
             <nz-tag>{{ store.activeVersion().source }}</nz-tag>
@@ -66,7 +116,7 @@
           <div class="version-note">
             <span>当前版本</span>
             <strong>{{ store.activeVersion().name }}</strong>
-            <small>所有编辑自动写入浏览器本地</small>
+            <small>输入只写入编辑会话；后台批次静默排队，不再逐字重算整篇</small>
           </div>
           <nz-divider></nz-divider>
           <div class="keyboard-map">
@@ -80,7 +130,7 @@
         <main class="meter-panel surface">
           <div class="section-title">
             <div>
-              <span class="overline">METER GRID</span>
+              <span class="overline">METER GRID · 同一确认版本</span>
               <h2>逐字格律标注</h2>
             </div>
             <div class="legend">
@@ -88,27 +138,40 @@
               <span class="legend-dot variant"></span>可接受
               <span class="legend-dot error"></span>出律
               <span class="legend-dot unknown"></span>待标
+              <span class="legend-dot pending"></span>待分析
             </div>
           </div>
-          <div class="meter-lines">
-            @for (line of store.analysis(); track line.index) {
-              <article class="meter-line" [class.is-rhyme-line]="store.template().rhymeLines.includes(line.index)">
-                <div class="line-label">
-                  <strong>第 {{ line.index + 1 }} 句</strong>
+
+          <app-virtual-list #meterList class="meter-virtual" [items]="store.lineViews()" [itemHeight]="meterItemHeight" [itemTemplate]="meterLineTemplate"></app-virtual-list>
+          <ng-template #meterLineTemplate let-view let-index="index">
+            <article
+              class="meter-line"
+              [class.is-rhyme-line]="store.isRhymeLineByTemplate(index)"
+              [class.is-stale-line]="view.status === 'stale'"
+            >
+              <div class="line-label">
+                <strong>第 {{ index + 1 }} 句</strong>
+                @if (view.status === 'confirmed' && view.line; as line) {
                   <small>{{ line.errors }} 出律 · {{ line.variants }} 变体</small>
-                </div>
-                <div class="character-row">
+                } @else if (view.status === 'stale') {
+                  <small class="stale-label">旧版结论 · 待重算</small>
+                } @else {
+                  <small class="pending-label">待分析</small>
+                }
+              </div>
+              <div class="character-row">
+                @if (view.status !== 'pending' && view.line; as line) {
                   @for (cell of line.cells; track cell.position) {
                     <button
                       class="meter-character"
-                      [class.is-selected]="store.selectedLine() === line.index && store.selectedPosition() === cell.position"
+                      [class.is-selected]="store.selectedLine() === index && store.selectedPosition() === cell.position"
                       [class.is-correct]="cell.status === 'correct'"
                       [class.is-variant]="cell.status === 'variant'"
                       [class.is-error]="cell.status === 'error'"
                       [class.is-unknown]="cell.status === 'unknown'"
                       nz-tooltip
                       [nzTooltipTitle]="cell.message"
-                      (click)="store.selectCell(line.index, cell.position)"
+                      (click)="store.selectCell(index, cell.position)"
                     >
                       <span class="expected">{{ cell.expected }}／{{ cell.actual }}</span>
                       <span class="hanzi">{{ cell.char }}</span>
@@ -118,29 +181,51 @@
                       </span>
                     </button>
                   }
-                </div>
-                @if (store.template().rhymeLines.includes(line.index)) {
+                } @else {
+                  @for (char of view.liveChars; track $index) {
+                    <button
+                      class="meter-character is-pending"
+                      [class.is-selected]="store.selectedLine() === index && store.selectedPosition() === $index"
+                      nz-tooltip
+                      nzTooltipTitle="待分析：此句尚未进入已确认版本"
+                      (click)="store.selectCell(index, $index)"
+                    >
+                      <span class="expected">待分析</span>
+                      <span class="hanzi">{{ char }}</span>
+                      <span class="mark-row"><i>?</i></span>
+                    </button>
+                  }
+                }
+              </div>
+              <div class="line-side">
+                @if (store.isRhymeLineByTemplate(index)) {
                   <nz-tag nzColor="green">韵脚</nz-tag>
                 }
-              </article>
-            }
-          </div>
+                @if (view.status === 'stale') {
+                  <nz-tag nzColor="warning">旧版</nz-tag>
+                } @else if (view.status === 'pending') {
+                  <nz-tag>待分析</nz-tag>
+                }
+              </div>
+            </article>
+          </ng-template>
+
           <div class="meter-footer">
             <span>模板：{{ store.template().summary }}</span>
-            <span>一三五位置可判为可接受变体；韵脚重复单独提示。</span>
+            <span>字格只显示同一已确认分析版本；批次进行中不展示半成品结论。</span>
           </div>
         </main>
 
         <aside class="inspector-panel surface">
           <div class="section-title compact">
             <div>
-              <span class="overline">MARK INSPECTOR</span>
+              <span class="overline">MARK INSPECTOR · 编辑会话</span>
               <h2>字音判断依据</h2>
             </div>
           </div>
           @if (selectedCell(); as cell) {
-            <div class="selected-char-card">
-              <span class="large-hanzi">{{ cell.char }}</span>
+            <div class="selected-char-card" [class.is-pending-card]="cell.pending">
+              <span class="large-hanzi">{{ cell.char || '□' }}</span>
               <div>
                 <strong>第 {{ store.selectedLine() + 1 }} 句 · 第 {{ cell.position + 1 }} 字</strong>
                 <p>{{ cell.message }}</p>
@@ -164,7 +249,7 @@
             <textarea
               nz-input
               rows="3"
-              placeholder="韵书、异文或音义依据"
+              placeholder="韵书、异文或音义依据（分析进行中也可填写）"
               [ngModel]="cell.mark.basis"
               (ngModelChange)="updateSource($event)"
             ></textarea>
@@ -189,11 +274,19 @@
       <div class="audit-layout">
         <section class="surface audit-main">
           <div class="section-title">
-            <div><span class="overline">METER AUDIT</span><h2>检查结果</h2></div>
-            <nz-tag nzColor="processing">{{ store.issues().length }} 条记录</nz-tag>
+            <div><span class="overline">METER AUDIT · 已确认整版</span><h2>检查结果</h2></div>
+            @if (store.confirmedIssues(); as issues) {
+              <nz-tag [nzColor]="stale() ? 'warning' : 'processing'">{{ issues.length }} 条记录</nz-tag>
+            } @else {
+              <nz-tag nzColor="default">无已确认版本</nz-tag>
+            }
           </div>
-          <div class="issue-list">
-            @for (issue of store.issues(); track issue.id) {
+          @if (stale()) {
+            <nz-alert class="audit-alert" nzType="warning" nzShowIcon nzMessage="以下为上一版分析结论" nzDescription="正文已有改动，新批次整版确认前这些记录不作为本次结果。"></nz-alert>
+          }
+          @if (store.confirmedIssues(); as issues) {
+            <app-virtual-list class="issue-virtual" [items]="issues" [itemHeight]="issueItemHeight" [itemTemplate]="issueTemplate"></app-virtual-list>
+            <ng-template #issueTemplate let-issue>
               <button
                 class="issue-row"
                 [class.level-error]="issue.level === 'error'"
@@ -205,12 +298,16 @@
                 <span><strong>{{ issue.title }}</strong><small>{{ issue.detail }}</small></span>
                 @if (issue.line !== undefined) { <em>定位第 {{ issue.line + 1 }} 句</em> }
               </button>
-            }
-          </div>
+            </ng-template>
+          } @else {
+            <div class="audit-empty">
+              <nz-empty [nzNotFoundContent]="runState()?.phase === 'failed' ? '批次失败：等待从检查点继续后重新汇总' : '首个分析批次尚未整版确认'"></nz-empty>
+            </div>
+          }
         </section>
         <section class="surface antithesis-panel">
           <div class="section-title">
-            <div><span class="overline">PARALLELISM</span><h2>对仗关系</h2></div>
+            <div><span class="overline">PARALLELISM · 编辑会话</span><h2>对仗关系</h2></div>
             <button nz-button nzType="primary" (click)="store.addAntithesis()">添加对仗</button>
           </div>
           @if (store.activeVersion().antithesisPairs.length === 0) {
@@ -237,8 +334,8 @@
       <section class="surface compare-panel">
         <div class="compare-toolbar">
           <div>
-            <span class="overline">TEXTUAL VARIANTS</span>
-            <h2>逐字异文定位</h2>
+            <span class="overline">TEXTUAL VARIANTS · 同一确认版本</span>
+            <h2>逐句异文定位</h2>
           </div>
           <nz-select
             class="version-select"
@@ -254,30 +351,49 @@
           <button nz-button nzType="primary" (click)="store.nextDifference()">下一处异文</button>
           <nz-tag nzColor="error">{{ store.differences().length }} 处差异</nz-tag>
         </div>
-        @if (store.baselineVersion(); as baseline) {
+
+        @if (runState()?.phase === 'queued' || runState()?.phase === 'running') {
+          <nz-alert class="compare-alert" nzType="info" nzShowIcon nzMessage="后台批次进行中" nzDescription="下方对照锁定在同一已确认分析版本，切换对照不会重算；新批次整版确认后自动更新。"></nz-alert>
+        } @else if (stale()) {
+          <nz-alert class="compare-alert" nzType="warning" nzShowIcon nzMessage="对照基于上一版已确认快照" nzDescription="正文已改动，待新批次确认；当前不以旧结论冒充新结果。"></nz-alert>
+        }
+
+        @if (store.diffRows(); as rows) {
           <div class="compare-headings">
-            <div><span>底本</span><strong>{{ baseline.name }}</strong><small>{{ baseline.source }}</small></div>
-            <div><span>当前校勘稿</span><strong>{{ store.activeVersion().name }}</strong><small>{{ store.activeVersion().source }}</small></div>
+            <div><span>底本 · 已确认版</span><strong>{{ store.diffBaselineSnapshot()?.name ?? '—' }}</strong><small>{{ store.diffBaselineSnapshot()?.source }}</small></div>
+            <div><span>当前校勘稿 · 已确认版</span><strong>{{ store.diffActiveSnapshot()?.name ?? '—' }}</strong><small>分析版本 {{ confirmedRevision() }}</small></div>
           </div>
-          <div class="compare-text">
-            @for (item of store.diff(); track item.index) {
-              <span
-                class="diff-char"
-                [class.is-changed]="item.changed"
-                [class.is-current]="item.index === store.currentDiffIndex()"
-                [class.has-left]="!item.left"
-                [class.has-right]="!item.right"
-              >
-                <i>{{ item.left || '□' }}</i>
-                <b>{{ item.right || '□' }}</b>
-              </span>
-            }
-          </div>
+          <app-virtual-list #diffList class="diff-virtual" [items]="rows" [itemHeight]="diffItemHeight" [itemTemplate]="diffRowTemplate"></app-virtual-list>
+          <ng-template #diffRowTemplate let-row let-index="index">
+            <div class="diff-line" [class.is-current-line]="index === store.currentDiffRowIndex()">
+              <div class="diff-line-label">第 {{ index + 1 }} 句</div>
+              <div class="diff-chars">
+                @for (item of row.cells; track item.index) {
+                  <span
+                    class="diff-char"
+                    [class.is-changed]="item.changed"
+                    [class.is-current]="item.index === store.effectiveDiffIndex()"
+                    [class.has-left]="!item.left"
+                    [class.has-right]="!item.right"
+                  >
+                    <i>{{ item.left || '□' }}</i>
+                    <b>{{ item.right || '□' }}</b>
+                  </span>
+                }
+              </div>
+            </div>
+          </ng-template>
           <div class="compare-note">
-            <nz-alert nzType="info" nzShowIcon nzMessage="比较采用字符位置对齐" nzDescription="上方为上／底本字符，下方为当前版本。点击“下一处异文”可逐项定位。"></nz-alert>
+            <nz-alert nzType="info" nzShowIcon nzMessage="按句对齐，同一已确认分析版本内比较" nzDescription="上方为底本字符，下方为当前版本。点击“下一处异文”可逐项定位；对照切换不触发重算。"></nz-alert>
+          </div>
+        } @else if (!store.published()) {
+          <div class="compare-empty">
+            <nz-empty nzNotFoundContent="首个分析批次尚未确认，暂无可对照版本"></nz-empty>
           </div>
         } @else {
-          <nz-empty nzNotFoundContent="请选择一份异文底本"></nz-empty>
+          <div class="compare-empty">
+            <nz-empty nzNotFoundContent="底本或当前版本尚无同一批次的已确认结果，请等待整版分析完成"></nz-empty>
+          </div>
         }
       </section>
     </nz-tab>
@@ -286,7 +402,7 @@
       <div class="version-layout">
         <section class="surface version-cards">
           <div class="section-title">
-            <div><span class="overline">VERSIONS</span><h2>校勘版本</h2></div>
+            <div><span class="overline">VERSIONS · 编辑会话</span><h2>校勘版本</h2></div>
             <button nz-button (click)="store.duplicateActiveAsBaseline()">以当前版本为比较底本</button>
           </div>
           <div class="version-grid">
@@ -304,7 +420,7 @@
         <aside class="surface export-panel">
           <span class="overline">PROOFREAD EXPORT</span>
           <h2>导出校对稿</h2>
-          <p>包含逐字平仄、韵组、判断依据、出律提示与对仗记录。</p>
+          <p>已算完段落写入逐字结论；未算完段落写“待分析”，旧结论会显式标为旧版，不作冒充。</p>
           <button nz-button nzType="primary" nzSize="large" nzBlock (click)="store.downloadProofreadCopy()">导出 Markdown 校对稿</button>
           <nz-divider></nz-divider>
           <label class="field-label">当前底本说明</label>

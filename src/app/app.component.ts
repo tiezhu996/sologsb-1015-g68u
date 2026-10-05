@@ -1,4 +1,12 @@
-import { ChangeDetectionStrategy, Component, HostListener, computed, inject } from '@angular/core';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  HostListener,
+  computed,
+  effect,
+  inject,
+  viewChild,
+} from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { NzAlertModule } from 'ng-zorro-antd/alert';
@@ -14,6 +22,8 @@ import { NzTabsModule } from 'ng-zorro-antd/tabs';
 import { NzTagModule } from 'ng-zorro-antd/tag';
 import { NzToolTipModule } from 'ng-zorro-antd/tooltip';
 import { METER_TEMPLATES, PoetryStoreService } from './services/poetry-store.service';
+import type { LineView } from './models/poem.models';
+import { VirtualListComponent } from './shared/virtual-list.component';
 
 @Component({
   selector: 'app-root',
@@ -32,6 +42,7 @@ import { METER_TEMPLATES, PoetryStoreService } from './services/poetry-store.ser
     NzTabsModule,
     NzTagModule,
     NzToolTipModule,
+    VirtualListComponent,
   ],
   templateUrl: './app.component.html',
   styleUrl: './app.component.less',
@@ -40,20 +51,49 @@ import { METER_TEMPLATES, PoetryStoreService } from './services/poetry-store.ser
 export class AppComponent {
   readonly store = inject(PoetryStoreService);
   readonly templates = METER_TEMPLATES;
-  readonly selectedCell = computed(() => this.store.selectedCell());
 
-  get totalErrors(): number {
-    return this.store.issues().filter((issue) => issue.level === 'error').length;
+  private readonly meterList = viewChild<VirtualListComponent<LineView>>('meterList');
+  private readonly diffList = viewChild<VirtualListComponent<unknown>>('diffList');
+
+  readonly selectedCell = computed(() => this.store.selectedCellView());
+  readonly totalErrors = computed(() => (this.store.confirmedIssues() ?? []).filter((issue) => issue.level === 'error').length);
+  readonly totalWarnings = computed(() => (this.store.confirmedIssues() ?? []).filter((issue) => issue.level === 'warning').length);
+  readonly checkedRate = computed(() => this.store.liveMarkedRate());
+
+  readonly runState = computed(() => this.store.runState());
+  readonly stale = computed(() => this.store.analysisStale());
+  readonly confirmedRevision = computed(() => this.store.published()?.revision.slice(-6) ?? '');
+
+  readonly meterItemHeight = 118;
+  readonly diffItemHeight = 96;
+  readonly issueItemHeight = 62;
+
+  constructor() {
+    // 键盘巡校时把选中句滚入视口
+    effect(() => {
+      const line = this.store.selectedLine();
+      this.meterList()?.ensureIndexVisible(line);
+    });
+    effect(() => {
+      const row = this.store.currentDiffRowIndex();
+      if (row >= 0) this.diffList()?.ensureIndexVisible(row);
+    });
   }
 
-  get totalWarnings(): number {
-    return this.store.issues().filter((issue) => issue.level === 'warning').length;
+  batchPercent(): number {
+    const state = this.runState();
+    if (!state) return 0;
+    const done = state.confirmedCounts.reduce((sum, value) => sum + value, 0);
+    const total = state.totalCounts.reduce((sum, value) => sum + value, 0);
+    return total === 0 ? 0 : Math.round((done / total) * 100);
   }
 
-  get checkedRate(): number {
-    const cells = this.store.analysis().flatMap((line) => line.cells);
-    if (!cells.length) return 0;
-    return Math.round((cells.filter((cell) => cell.actual !== '?').length / cells.length) * 100);
+  batchDoneLines(): number {
+    return this.runState()?.confirmedCounts.reduce((sum, value) => sum + value, 0) ?? 0;
+  }
+
+  batchTotalLines(): number {
+    return this.runState()?.totalCounts.reduce((sum, value) => sum + value, 0) ?? 0;
   }
 
   setTone(tone: '平' | '仄' | '中' | '?'): void {
@@ -95,26 +135,24 @@ export class AppComponent {
     }
     if (inTextEntry) return;
 
+    const views = this.store.lineViews();
+    const lineLength = (index: number) => views[index]?.liveChars.length ?? 1;
     if (event.key === 'ArrowLeft') {
       event.preventDefault();
-      const line = this.store.analysis()[this.store.selectedLine()];
       const next = Math.max(0, this.store.selectedPosition() - 1);
-      this.store.selectCell(this.store.selectedLine(), Math.min(next, Math.max(0, line?.cells.length - 1)));
+      this.store.selectCell(this.store.selectedLine(), next);
     } else if (event.key === 'ArrowRight') {
       event.preventDefault();
-      const line = this.store.analysis()[this.store.selectedLine()];
-      const next = Math.min((line?.cells.length ?? 1) - 1, this.store.selectedPosition() + 1);
+      const next = Math.min(Math.max(0, lineLength(this.store.selectedLine()) - 1), this.store.selectedPosition() + 1);
       this.store.selectCell(this.store.selectedLine(), next);
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
       const next = Math.max(0, this.store.selectedLine() - 1);
-      const max = Math.max(0, (this.store.analysis()[next]?.cells.length ?? 1) - 1);
-      this.store.selectCell(next, Math.min(this.store.selectedPosition(), max));
+      this.store.selectCell(next, Math.min(this.store.selectedPosition(), Math.max(0, lineLength(next) - 1)));
     } else if (event.key === 'ArrowDown') {
       event.preventDefault();
-      const next = Math.min(this.store.analysis().length - 1, this.store.selectedLine() + 1);
-      const max = Math.max(0, (this.store.analysis()[next]?.cells.length ?? 1) - 1);
-      this.store.selectCell(next, Math.min(this.store.selectedPosition(), max));
+      const next = Math.min(views.length - 1, this.store.selectedLine() + 1);
+      this.store.selectCell(next, Math.min(this.store.selectedPosition(), Math.max(0, lineLength(next) - 1)));
     } else if (event.key === '1') {
       this.setTone('平');
     } else if (event.key === '2') {
