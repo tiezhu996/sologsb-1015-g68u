@@ -45,12 +45,15 @@ export interface MeterTemplate {
   rhymeLines: number[];
 }
 
+/** 单格状态：analyzed 系列来自已确认分析版本，pending 表示该段落尚未分析。 */
+export type CellStatus = 'correct' | 'variant' | 'error' | 'unknown' | 'neutral' | 'pending';
+
 export interface AnalysisCell {
   char: string;
   position: number;
   expected: Tone;
   actual: Tone;
-  status: 'correct' | 'variant' | 'error' | 'unknown' | 'neutral';
+  status: CellStatus;
   message: string;
   mark: CharacterMark;
 }
@@ -72,9 +75,68 @@ export interface PoemIssue {
   position?: number;
 }
 
-export interface CharDiff {
-  index: number;
+/** 异文逐字格：整行同属一次已确认版本，未确认一侧留空。 */
+export interface DiffCell {
   left: string;
   right: string;
   changed: boolean;
+}
+
+export interface DiffLine {
+  line: number;
+  left: string;
+  right: string;
+  changed: boolean;
+  cells: DiffCell[];
+}
+
+/**
+ * 分析版本（不可变快照）。
+ * 字格与异文对照都只读取同一个已确认版本，绝不在编辑过程中混入中间结果。
+ */
+export interface AnalysisSnapshot {
+  /** 被分析版本的内容指纹（正文 + 标记 + 模板）。 */
+  revision: string;
+  /** 逐行内容指纹，导出校对稿时据此判定段落是否属于本次确认结果。 */
+  lineFingerprints: string[];
+  templateId: string;
+  analyzedAt: string;
+  text: string;
+  lines: AnalysisLine[];
+  issues: PoemIssue[];
+}
+
+/** 后台分析批次的运行状态，与正文编辑会话完全隔离。 */
+export type AnalysisPhase = 'idle' | 'queued' | 'running' | 'completed' | 'failed';
+
+/** 一个版本对应一份检查点：已完成的批次结果可在重开或失败后续跑。 */
+export interface AnalysisCheckpoint {
+  revision: string;
+  templateId: string;
+  /** 已完成批次（按起始行索引排序）。 */
+  batches: AnalysisBatch[];
+  /** 已完成的最大行索引（不含）。 */
+  doneLineCount: number;
+  totalLineCount: number;
+  phase: AnalysisPhase;
+  error?: string;
+  updatedAt: string;
+}
+
+export interface AnalysisBatch {
+  startLine: number;
+  endLine: number;
+  lines: AnalysisLine[];
+}
+
+/** 暴露给界面的批次运行视图。 */
+export interface AnalysisRunState {
+  phase: AnalysisPhase;
+  revision: string;
+  totalLineCount: number;
+  doneLineCount: number;
+  failedBatchStart: number;
+  error: string;
+  /** 队列中排在当前版本之后的版本数。 */
+  queuedVersions: number;
 }

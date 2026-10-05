@@ -1,8 +1,8 @@
-import { ChangeDetectionStrategy, Component, HostListener, computed, inject } from '@angular/core';
+import { AfterViewInit, ChangeDetectionStrategy, Component, HostListener, computed, effect, inject, viewChild } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { CdkVirtualScrollViewport, ScrollingModule } from '@angular/cdk/scrolling';
 import { NzAlertModule } from 'ng-zorro-antd/alert';
-import { NzBadgeModule } from 'ng-zorro-antd/badge';
 import { NzButtonModule } from 'ng-zorro-antd/button';
 import { NzDividerModule } from 'ng-zorro-antd/divider';
 import { NzEmptyModule } from 'ng-zorro-antd/empty';
@@ -14,14 +14,15 @@ import { NzTabsModule } from 'ng-zorro-antd/tabs';
 import { NzTagModule } from 'ng-zorro-antd/tag';
 import { NzToolTipModule } from 'ng-zorro-antd/tooltip';
 import { METER_TEMPLATES, PoetryStoreService } from './services/poetry-store.service';
+import type { ViewLine } from './services/poetry-store.service';
 
 @Component({
   selector: 'app-root',
   imports: [
     CommonModule,
     FormsModule,
+    ScrollingModule,
     NzAlertModule,
-    NzBadgeModule,
     NzButtonModule,
     NzDividerModule,
     NzEmptyModule,
@@ -37,10 +38,33 @@ import { METER_TEMPLATES, PoetryStoreService } from './services/poetry-store.ser
   styleUrl: './app.component.less',
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
-export class AppComponent {
+export class AppComponent implements AfterViewInit {
   readonly store = inject(PoetryStoreService);
   readonly templates = METER_TEMPLATES;
   readonly selectedCell = computed(() => this.store.selectedCell());
+  readonly viewLines = computed(() => this.store.viewLines());
+
+  /** 虚拟滚动按“句”成批渲染，避免两千句同时进 DOM。 */
+  readonly lineItemSize = 96;
+
+  readonly gridViewport = viewChild<CdkVirtualScrollViewport>('gridViewport');
+
+  constructor() {
+    // 键盘巡校可能选中虚拟视口之外的句子，滚动到可见范围。
+    effect(() => {
+      const line = this.store.selectedLine();
+      this.gridViewport()?.scrollToIndex(line, 'smooth');
+    });
+  }
+
+  ngAfterViewInit(): void {
+    this.gridViewport()?.scrollToIndex(this.store.selectedLine());
+  }
+
+  setBaseline(versionId: string): void {
+    this.store.baselineVersionId.set(versionId);
+    this.store.ensureVersionAnalyzed(versionId);
+  }
 
   get totalErrors(): number {
     return this.store.issues().filter((issue) => issue.level === 'error').length;
@@ -50,10 +74,26 @@ export class AppComponent {
     return this.store.issues().filter((issue) => issue.level === 'warning').length;
   }
 
+  /** 已确认分析版本的覆盖率：未算完段落不计入“已标注”。 */
   get checkedRate(): number {
-    const cells = this.store.analysis().flatMap((line) => line.cells);
+    const confirmed = this.store.analysis();
+    const cells = confirmed.flatMap((line) => line.cells);
     if (!cells.length) return 0;
     return Math.round((cells.filter((cell) => cell.actual !== '?').length / cells.length) * 100);
+  }
+
+  get analysisPercent(): number {
+    const run = this.store.analysisRun();
+    if (!run.totalLineCount) return 0;
+    return Math.round((run.doneLineCount / run.totalLineCount) * 100);
+  }
+
+  get isAnalyzing(): boolean {
+    return this.store.analysisRun().phase === 'running' || this.store.analysisRun().phase === 'queued';
+  }
+
+  get analysisFailed(): boolean {
+    return this.store.analysisRun().phase === 'failed';
   }
 
   setTone(tone: '平' | '仄' | '中' | '?'): void {
@@ -66,6 +106,10 @@ export class AppComponent {
 
   updateVersionSource(source: string): void {
     this.store.updateVersionSource(source);
+  }
+
+  trackLine(_index: number, line: ViewLine): number {
+    return line.index;
   }
 
   trackTemplate(index: number, item: (typeof METER_TEMPLATES)[number]): string {
@@ -95,25 +139,26 @@ export class AppComponent {
     }
     if (inTextEntry) return;
 
+    const view = this.store.viewLines();
     if (event.key === 'ArrowLeft') {
       event.preventDefault();
-      const line = this.store.analysis()[this.store.selectedLine()];
+      const line = view[this.store.selectedLine()];
       const next = Math.max(0, this.store.selectedPosition() - 1);
-      this.store.selectCell(this.store.selectedLine(), Math.min(next, Math.max(0, line?.cells.length - 1)));
+      this.store.selectCell(this.store.selectedLine(), Math.min(next, Math.max(0, (line?.source.cells.length ?? 1) - 1)));
     } else if (event.key === 'ArrowRight') {
       event.preventDefault();
-      const line = this.store.analysis()[this.store.selectedLine()];
-      const next = Math.min((line?.cells.length ?? 1) - 1, this.store.selectedPosition() + 1);
+      const line = view[this.store.selectedLine()];
+      const next = Math.min((line?.source.cells.length ?? 1) - 1, this.store.selectedPosition() + 1);
       this.store.selectCell(this.store.selectedLine(), next);
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
       const next = Math.max(0, this.store.selectedLine() - 1);
-      const max = Math.max(0, (this.store.analysis()[next]?.cells.length ?? 1) - 1);
+      const max = Math.max(0, (view[next]?.source.cells.length ?? 1) - 1);
       this.store.selectCell(next, Math.min(this.store.selectedPosition(), max));
     } else if (event.key === 'ArrowDown') {
       event.preventDefault();
-      const next = Math.min(this.store.analysis().length - 1, this.store.selectedLine() + 1);
-      const max = Math.max(0, (this.store.analysis()[next]?.cells.length ?? 1) - 1);
+      const next = Math.min(view.length - 1, this.store.selectedLine() + 1);
+      const max = Math.max(0, (view[next]?.source.cells.length ?? 1) - 1);
       this.store.selectCell(next, Math.min(this.store.selectedPosition(), max));
     } else if (event.key === '1') {
       this.setTone('平');

@@ -17,7 +17,7 @@
         nzStrokeColor="#3f7c6c"
         [nzStrokeWidth]="6"
       ></nz-progress>
-      <span class="status-copy">已标注 {{ checkedRate }}%</span>
+      <span class="status-copy">已确认标注 {{ checkedRate }}%</span>
     </div>
     <div class="header-actions">
       <button nz-button nz-tooltip nzTooltipTitle="撤销 Ctrl/Cmd+Z" [disabled]="store.undoCount() === 0" (click)="store.undo()">撤销</button>
@@ -41,7 +41,7 @@
     <div class="issue-pills">
       <nz-tag nzColor="error">{{ totalErrors }} 处出律</nz-tag>
       <nz-tag nzColor="warning">{{ totalWarnings }} 处待核</nz-tag>
-      <nz-tag>{{ store.differences().length }} 处异文</nz-tag>
+      <nz-tag>{{ store.differenceLines().length }} 行异文</nz-tag>
     </div>
   </section>
 
@@ -51,7 +51,7 @@
         <aside class="source-panel surface">
           <div class="section-title">
             <div>
-              <span class="overline">TEXT SOURCE</span>
+              <span class="overline">TEXT SOURCE · 编辑会话</span>
               <h2>诗句文本</h2>
             </div>
             <nz-tag>{{ store.activeVersion().source }}</nz-tag>
@@ -66,8 +66,47 @@
           <div class="version-note">
             <span>当前版本</span>
             <strong>{{ store.activeVersion().name }}</strong>
-            <small>所有编辑自动写入浏览器本地</small>
+            <small>输入与批注随时可继续；停笔后自动排队分析，编辑中的批次立即作废。</small>
           </div>
+
+          <div class="analysis-card" [class.is-running]="isAnalyzing" [class.is-failed]="analysisFailed">
+            <div class="analysis-head">
+              <span class="overline">BACKGROUND ANALYSIS · 后台批次</span>
+              @switch (store.analysisRun().phase) {
+                @case ('queued') { <nz-tag nzColor="processing">排队中 · 前面 {{ store.analysisRun().queuedVersions }} 个版本</nz-tag> }
+                @case ('running') { <nz-tag nzColor="processing">分析中 {{ analysisPercent }}%</nz-tag> }
+                @case ('completed') { <nz-tag nzColor="success">已确认</nz-tag> }
+                @case ('failed') { <nz-tag nzColor="error">批次失败</nz-tag> }
+                @default { <nz-tag>空闲</nz-tag> }
+              }
+            </div>
+            @if (store.analysisRun().totalLineCount > 0) {
+              <nz-progress
+                [nzPercent]="analysisPercent"
+                [nzStatus]="analysisFailed ? 'exception' : isAnalyzing ? 'active' : 'normal'"
+                [nzStrokeWidth]="8"
+              ></nz-progress>
+              <p class="analysis-copy">
+                已完成 {{ store.analysisRun().doneLineCount }} / {{ store.analysisRun().totalLineCount }} 句，
+                按批次排队让出主线程，不影响输入。
+              </p>
+            }
+            @if (analysisFailed) {
+              <nz-alert
+                nzType="error"
+                nzShowIcon
+                nzMessage="分析批次失败，已保留上一版完整结果"
+                [nzDescription]="'失败位置：第 ' + (store.analysisRun().failedBatchStart + 1) + ' 句起；检查点已保存，可从断点继续。'"
+              ></nz-alert>
+              <div class="analysis-actions">
+                <button nz-button nzSize="small" nzType="primary" (click)="store.retryAnalysis()">从检查点继续</button>
+              </div>
+            }
+            <div class="analysis-actions">
+              <button nz-button nzSize="small" (click)="store.runAnalysisNow()" [disabled]="isAnalyzing">立即重新排队分析</button>
+            </div>
+          </div>
+
           <nz-divider></nz-divider>
           <div class="keyboard-map">
             <span class="overline">键盘巡校</span>
@@ -80,7 +119,7 @@
         <main class="meter-panel surface">
           <div class="section-title">
             <div>
-              <span class="overline">METER GRID</span>
+              <span class="overline">METER GRID · 只读同一已确认分析版本</span>
               <h2>逐字格律标注</h2>
             </div>
             <div class="legend">
@@ -88,46 +127,61 @@
               <span class="legend-dot variant"></span>可接受
               <span class="legend-dot error"></span>出律
               <span class="legend-dot unknown"></span>待标
+              <span class="legend-dot pending"></span>待分析
             </div>
           </div>
-          <div class="meter-lines">
-            @for (line of store.analysis(); track line.index) {
-              <article class="meter-line" [class.is-rhyme-line]="store.template().rhymeLines.includes(line.index)">
-                <div class="line-label">
-                  <strong>第 {{ line.index + 1 }} 句</strong>
-                  <small>{{ line.errors }} 出律 · {{ line.variants }} 变体</small>
-                </div>
-                <div class="character-row">
-                  @for (cell of line.cells; track cell.position) {
-                    <button
-                      class="meter-character"
-                      [class.is-selected]="store.selectedLine() === line.index && store.selectedPosition() === cell.position"
-                      [class.is-correct]="cell.status === 'correct'"
-                      [class.is-variant]="cell.status === 'variant'"
-                      [class.is-error]="cell.status === 'error'"
-                      [class.is-unknown]="cell.status === 'unknown'"
-                      nz-tooltip
-                      [nzTooltipTitle]="cell.message"
-                      (click)="store.selectCell(line.index, cell.position)"
-                    >
-                      <span class="expected">{{ cell.expected }}／{{ cell.actual }}</span>
-                      <span class="hanzi">{{ cell.char }}</span>
-                      <span class="mark-row">
-                        @if (cell.mark.rhyme) { <em>{{ cell.mark.rhyme }}</em> }
-                        @if (cell.mark.pauseAfter) { <i>顿</i> }
-                      </span>
-                    </button>
-                  }
-                </div>
-                @if (store.template().rhymeLines.includes(line.index)) {
-                  <nz-tag nzColor="green">韵脚</nz-tag>
+          <cdk-virtual-scroll-viewport
+            #gridViewport
+            [itemSize]="lineItemSize"
+            class="meter-viewport"
+            [class.mask-disabled]="isAnalyzing"
+          >
+            <article
+              *cdkVirtualFor="let line of viewLines(); trackBy: trackLine; let i = index"
+              class="meter-line"
+              [class.is-rhyme-line]="store.template().rhymeLines.includes(line.index)"
+              [class.is-pending]="!line.confirmed"
+            >
+              <div class="line-label">
+                <strong>第 {{ line.index + 1 }} 句</strong>
+                @if (line.confirmed) {
+                  <small>{{ line.source.errors }} 出律 · {{ line.source.variants }} 变体</small>
+                  <em class="line-state ok">已算完</em>
+                } @else {
+                  <em class="line-state wait">待分析</em>
                 }
-              </article>
-            }
-          </div>
+              </div>
+              <div class="character-row">
+                @for (cell of line.source.cells; track cell.position) {
+                  <button
+                    class="meter-character"
+                    [class.is-selected]="store.selectedLine() === line.index && store.selectedPosition() === cell.position"
+                    [class.is-correct]="cell.status === 'correct'"
+                    [class.is-variant]="cell.status === 'variant'"
+                    [class.is-error]="cell.status === 'error'"
+                    [class.is-unknown]="cell.status === 'unknown'"
+                    [class.is-pending]="cell.status === 'pending'"
+                    nz-tooltip
+                    [nzTooltipTitle]="cell.message"
+                    (click)="store.selectCell(line.index, cell.position)"
+                  >
+                    <span class="expected">{{ cell.status === 'pending' ? '待分析' : cell.expected + '／' + cell.actual }}</span>
+                    <span class="hanzi">{{ cell.char }}</span>
+                    <span class="mark-row">
+                      @if (cell.mark.rhyme) { <em>{{ cell.mark.rhyme }}</em> }
+                      @if (cell.mark.pauseAfter) { <i>顿</i> }
+                    </span>
+                  </button>
+                }
+              </div>
+              @if (store.template().rhymeLines.includes(line.index)) {
+                <nz-tag nzColor="green">韵脚</nz-tag>
+              }
+            </article>
+          </cdk-virtual-scroll-viewport>
           <div class="meter-footer">
             <span>模板：{{ store.template().summary }}</span>
-            <span>一三五位置可判为可接受变体；韵脚重复单独提示。</span>
+            <span>灰色“待分析”行没有任何旧结论；全部批次确认后才会更新字格。</span>
           </div>
         </main>
 
@@ -144,6 +198,9 @@
               <div>
                 <strong>第 {{ store.selectedLine() + 1 }} 句 · 第 {{ cell.position + 1 }} 字</strong>
                 <p>{{ cell.message }}</p>
+                @if (cell.status === 'pending') {
+                  <small class="pending-hint">该段待分析；以下批注照常记录，确认分析后自动参与对照。</small>
+                }
               </div>
             </div>
             <label class="field-label">平仄</label>
@@ -172,7 +229,7 @@
             <textarea
               nz-input
               rows="3"
-              placeholder="记录校勘判断"
+              placeholder="记录校勘判断（分析排队期间也可继续书写）"
               [ngModel]="cell.mark.note"
               (ngModelChange)="store.setMark({ note: $event })"
             ></textarea>
@@ -189,7 +246,7 @@
       <div class="audit-layout">
         <section class="surface audit-main">
           <div class="section-title">
-            <div><span class="overline">METER AUDIT</span><h2>检查结果</h2></div>
+            <div><span class="overline">METER AUDIT · 已确认分析版本</span><h2>检查结果</h2></div>
             <nz-tag nzColor="processing">{{ store.issues().length }} 条记录</nz-tag>
           </div>
           <div class="issue-list">
@@ -237,14 +294,14 @@
       <section class="surface compare-panel">
         <div class="compare-toolbar">
           <div>
-            <span class="overline">TEXTUAL VARIANTS</span>
+            <span class="overline">TEXTUAL VARIANTS · 两侧均取已确认分析版本</span>
             <h2>逐字异文定位</h2>
           </div>
           <nz-select
             class="version-select"
             nzPlaceHolder="选择比较底本"
             [ngModel]="store.baselineVersionId()"
-            (ngModelChange)="store.baselineVersionId.set($event)"
+            (ngModelChange)="setBaseline($event)"
           >
             @for (version of store.workspace().versions; track version.id) {
               <nz-option [nzValue]="version.id" [nzLabel]="version.name"></nz-option>
@@ -252,32 +309,46 @@
           </nz-select>
           <button nz-button (click)="store.previousDifference()">上一处异文</button>
           <button nz-button nzType="primary" (click)="store.nextDifference()">下一处异文</button>
-          <nz-tag nzColor="error">{{ store.differences().length }} 处差异</nz-tag>
+          <nz-tag nzColor="error">{{ store.differenceLines().length }} 行差异</nz-tag>
         </div>
         @if (store.baselineVersion(); as baseline) {
-          <div class="compare-headings">
-            <div><span>底本</span><strong>{{ baseline.name }}</strong><small>{{ baseline.source }}</small></div>
-            <div><span>当前校勘稿</span><strong>{{ store.activeVersion().name }}</strong><small>{{ store.activeVersion().source }}</small></div>
-          </div>
-          <div class="compare-text">
-            @for (item of store.diff(); track item.index) {
-              <span
-                class="diff-char"
-                [class.is-changed]="item.changed"
-                [class.is-current]="item.index === store.currentDiffIndex()"
-                [class.has-left]="!item.left"
-                [class.has-right]="!item.right"
+          @if (store.diffReady()) {
+            <div class="compare-headings">
+              <div><span>底本</span><strong>{{ baseline.name }}</strong><small>{{ baseline.source }}</small></div>
+              <div><span>当前校勘稿</span><strong>{{ store.activeVersion().name }}</strong><small>{{ store.activeVersion().source }}</small></div>
+            </div>
+            <cdk-virtual-scroll-viewport [itemSize]="60" class="compare-viewport">
+              <div
+                *cdkVirtualFor="let row of store.diffLines(); let i = index"
+                class="diff-line"
+                [class.is-changed]="row.changed"
+                [class.is-current]="row.line === store.currentDiffLine()"
+                (click)="store.currentDiffLine.set(row.line)"
               >
-                <i>{{ item.left || '□' }}</i>
-                <b>{{ item.right || '□' }}</b>
-              </span>
-            }
-          </div>
-          <div class="compare-note">
-            <nz-alert nzType="info" nzShowIcon nzMessage="比较采用字符位置对齐" nzDescription="上方为上／底本字符，下方为当前版本。点击“下一处异文”可逐项定位。"></nz-alert>
-          </div>
+                <span class="diff-index">{{ row.line + 1 }}</span>
+                <div class="diff-cells">
+                  @for (cell of row.cells; track $index) {
+                    <span class="diff-char" [class.is-changed]="cell.changed">
+                      <i>{{ cell.left || '□' }}</i>
+                      <b>{{ cell.right || '□' }}</b>
+                    </span>
+                  }
+                </div>
+              </div>
+            </cdk-virtual-scroll-viewport>
+            <div class="compare-note">
+              <nz-alert
+                nzType="info"
+                nzShowIcon
+                nzMessage="两侧都来自已确认的分析版本"
+                nzDescription="重新编辑后，在新分析全部批次确认前，本对照不会展示任何中间或旧结论。"
+              ></nz-alert>
+            </div>
+          } @else {
+            <nz-empty class="compare-empty" [nzNotFoundContent]="'两侧版本均完成后台分析后才可并排比较（当前存在待确认版本）'"></nz-empty>
+          }
         } @else {
-          <nz-empty nzNotFoundContent="请选择一份异文底本"></nz-empty>
+          <nz-empty class="compare-empty" nzNotFoundContent="请选择一份异文底本"></nz-empty>
         }
       </section>
     </nz-tab>
@@ -304,7 +375,7 @@
         <aside class="surface export-panel">
           <span class="overline">PROOFREAD EXPORT</span>
           <h2>导出校对稿</h2>
-          <p>包含逐字平仄、韵组、判断依据、出律提示与对仗记录。</p>
+          <p>已算完段落随附逐字平仄与检查记录；未算完段落明确写“待分析”，不以旧结论冒充。</p>
           <button nz-button nzType="primary" nzSize="large" nzBlock (click)="store.downloadProofreadCopy()">导出 Markdown 校对稿</button>
           <nz-divider></nz-divider>
           <label class="field-label">当前底本说明</label>

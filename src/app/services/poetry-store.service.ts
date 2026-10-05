@@ -1,10 +1,12 @@
-import { computed, Injectable, signal } from '@angular/core';
+import { computed, DestroyRef, inject, Injectable, NgZone, signal } from '@angular/core';
 import type {
-  AntithesisPair,
-  AnalysisCell,
   AnalysisLine,
+  AnalysisRunState,
+  AnalysisSnapshot,
+  AntithesisPair,
   CharacterMark,
-  CharDiff,
+  DiffCell,
+  DiffLine,
   MarkTone,
   MeterTemplate,
   PoemIssue,
@@ -12,6 +14,7 @@ import type {
   PoemWorkspace,
   Tone,
 } from '../models/poem.models';
+import { AnalysisEngineService } from './analysis-engine.service';
 
 export const METER_TEMPLATES: MeterTemplate[] = [
   {
@@ -53,18 +56,20 @@ export const METER_TEMPLATES: MeterTemplate[] = [
 ];
 
 const STORAGE_KEY = 'sologsb-1015-poetry-workspace-v1';
+const CHECKPOINT_KEY = 'sologsb-1015-analysis-checkpoints-v1';
 const PUNCTUATION = new Set(['，', '。', '！', '？', '；', '：', '、', ' ', '\t']);
-const TONE_DICTIONARY: Record<string, Tone> = {
-  春: '平', 眠: '平', 不: '仄', 觉: '仄', 晓: '仄', 处: '仄', 闻: '平', 啼: '平', 鸟: '仄',
-  夜: '仄', 来: '平', 风: '平', 雨: '仄', 声: '平', 花: '平', 落: '仄', 知: '平', 多: '平', 少: '仄',
-  国: '仄', 破: '仄', 山: '平', 河: '平', 在: '仄', 城: '平', 深: '平', 木: '仄', 草: '仄', 独: '仄',
-  明: '平', 月: '仄', 高: '平', 天: '平', 故: '仄', 乡: '平', 万: '仄', 里: '仄', 江: '平', 船: '平',
-};
+
+/** 正文变更后排队前的静默窗口，保证逐字输入不被分析打断。 */
+const ANALYZE_DEBOUNCE_MS = 500;
+/** 本地落库做节流，避免每次击键都全量 JSON.stringify。 */
+const PERSIST_DEBOUNCE_MS = 400;
+/** 连续文本输入合并为一次撤销记录的窗口。 */
+const TEXT_UNDO_COALESCE_MS = 900;
 
 const clone = <T>(value: T): T => structuredClone(value);
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 
-function key(line: number, position: number): string {
+function keyOf(line: number, position: number): string {
   return `${line}:${position}`;
 }
 
@@ -80,19 +85,18 @@ function initialWorkspace(): PoemWorkspace {
     ['晓', 0, '平', false], ['鸟', 1, '平', false], ['声', 2, '平', false], ['少', 3, '平', false],
   ] as const;
   cells.forEach(([char, line, tone, pause]) => {
-    marks[key(line, 4)] = { tone, rhyme: 'A', pauseAfter: pause, basis: '《平水韵》上声十七筱', note: `${char} 为韵脚` };
+    marks[keyOf(line, 4)] = { tone, rhyme: 'A', pauseAfter: pause, basis: '《平水韵》上声十七筱', note: `${char} 为韵脚` };
   });
-  marks[key(0, 2)] = { tone: '平', rhyme: '', pauseAfter: false, basis: '平水韵', note: '句中平声' };
-  marks[key(1, 2)] = { tone: '平', rhyme: '', pauseAfter: false, basis: '平水韵', note: '' };
-  marks[key(2, 2)] = { tone: '平', rhyme: '', pauseAfter: false, basis: '平水韵', note: '' };
+  marks[keyOf(0, 2)] = { tone: '平', rhyme: '', pauseAfter: false, basis: '平水韵', note: '句中平声' };
+  marks[keyOf(1, 2)] = { tone: '平', rhyme: '', pauseAfter: false, basis: '平水韵', note: '' };
+  marks[keyOf(2, 2)] = { tone: '平', rhyme: '', pauseAfter: false, basis: '平水韵', note: '' };
 
-  const variants = spring.replace('处处闻啼鸟', '处处闻啼鸟');
   const topVersion: PoemVersion = {
     id: 'version-main',
     name: '通行本 · 孟浩然集',
     source: '《孟浩然诗集笺注》',
     createdAt: now,
-    text: variants,
+    text: spring,
     marks,
     antithesisPairs: [],
   };
@@ -126,135 +130,228 @@ function loadWorkspace(): PoemWorkspace {
   }
 }
 
+/** 供界面渲染的一行：confirmed 来自已确认分析版本，pending 表示该行尚未分析。 */
+export interface ViewLine {
+  index: number;
+  confirmed: boolean;
+  source: AnalysisLine;
+}
+
 @Injectable({ providedIn: 'root' })
 export class PoetryStoreService {
+  private readonly engine = inject(AnalysisEngineService);
+  private readonly zone = inject(NgZone);
+  private readonly destroyRef = inject(DestroyRef);
+
+  /** —— 正文编辑会话：只承载用户正在编辑的内容，与分析状态完全隔离。 —— */
   readonly workspace = signal<PoemWorkspace>(loadWorkspace());
   readonly selectedLine = signal(0);
   readonly selectedPosition = signal(4);
   readonly baselineVersionId = signal<string>('');
-  readonly currentDiffIndex = signal(0);
+  readonly currentDiffLine = signal(0);
   readonly toast = signal('');
   readonly undoCount = signal(0);
   readonly redoCount = signal(0);
 
-  private undoStack: PoemWorkspace[] = [];
-  private redoStack: PoemWorkspace[] = [];
+  /** 自增版本号：编辑会话每次提交都推进，驱动编辑视图刷新，但不触碰分析结果。 */
+  private readonly editEpoch = signal(0);
+
+  private undoStack: HistoryEntry[] = [];
+  private redoStack: HistoryEntry[] = [];
+  private lastTextEditAt = 0;
+  private textCoalesceSeq = 0;
+
+  private analyzeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor() {
+    this.engine.connect({
+      storageKey: CHECKPOINT_KEY,
+      work: (versionId) => {
+        const state = this.workspace();
+        const version = state.versions.find((item) => item.id === versionId) ?? state.versions[0];
+        const template = METER_TEMPLATES.find((item) => item.id === state.templateId) ?? METER_TEMPLATES[0];
+        return version ? { version, template } : null;
+      },
+      onConfirmed: (versionId) => {
+        if (versionId === this.workspace().activeVersionId) this.editEpoch.update((n) => n + 1);
+      },
+      tick: () => this.editEpoch.update((n) => n + 1),
+    });
+
+    // 重开：完成态检查点直接重建为已确认版本；失败态从检查点续跑。
+    const state = this.workspace();
+    state.versions.forEach((version) => {
+      const template = METER_TEMPLATES.find((item) => item.id === state.templateId) ?? METER_TEMPLATES[0];
+      this.engine.restoreConfirmed(version.id, version, template);
+    });
+    this.queueFailedResumes();
+    this.scheduleAnalysis(this.workspace().activeVersionId);
+
+    const flush = () => this.persistNow();
+    window.addEventListener('beforeunload', flush);
+    this.destroyRef.onDestroy(() => window.removeEventListener('beforeunload', flush));
+  }
+
+  // ---------------------------------------------------------------------------
+  // 编辑会话派生数据（纯文本视图，便宜，不做整篇格律计算）
+  // ---------------------------------------------------------------------------
 
   readonly activeVersion = computed(() => {
+    this.editEpoch();
     const state = this.workspace();
     return state.versions.find((version) => version.id === state.activeVersionId) ?? state.versions[0];
   });
 
   readonly template = computed(() => {
+    this.editEpoch();
     return METER_TEMPLATES.find((item) => item.id === this.workspace().templateId) ?? METER_TEMPLATES[0];
   });
 
-  readonly lines = computed(() => this.activeVersion().text.split('\n'));
+  readonly lines = computed(() => {
+    this.editEpoch();
+    return this.activeVersion().text.split('\n');
+  });
 
-  readonly analysis = computed<AnalysisLine[]>(() => {
+  /** 当前版本分析批次状态（排队/运行/失败/完成），与输入框无关。 */
+  readonly analysisRun = computed<AnalysisRunState>(() => {
+    this.editEpoch();
+    return this.engine.runState(this.activeVersion().id);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 已确认分析版本的唯一出口：字格、问题清单、校对稿全部读这里
+  // ---------------------------------------------------------------------------
+
+  private readonly confirmedSnapshot = computed<AnalysisSnapshot | undefined>(() => {
+    this.editEpoch();
     const version = this.activeVersion();
+    const snapshot = this.engine.snapshot(version.id);
+    if (!snapshot || snapshot.templateId !== this.workspace().templateId) return undefined;
+    return snapshot;
+  });
+
+  /** 已确认结果中，与当前正文逐行对得上的行；其余一律视为待分析，绝不拿旧结论冒充。 */
+  readonly viewLines = computed<ViewLine[]>(() => {
+    this.editEpoch();
+    const snapshot = this.confirmedSnapshot();
+    const rawLines = this.activeVersion().text.split('\n');
+    const marks = this.activeVersion().marks;
     const template = this.template();
-    return this.lines().map((line, lineIndex) => {
-      const chars = Array.from(line).filter((char) => !PUNCTUATION.has(char));
-      const cells: AnalysisCell[] = chars.map((char, position) => {
-        const mark = version.marks[key(lineIndex, position)] ?? defaultMark();
-        const expected = template.pattern[lineIndex * template.lineLength + position] ?? '中';
-        const actual = mark.tone === '?' ? (TONE_DICTIONARY[char] ?? '?') : mark.tone;
-        let status: AnalysisCell['status'] = 'neutral';
-        let message = '标点或不计律位置';
-        if (PUNCTUATION.has(char)) {
-          status = 'neutral';
-        } else if (actual === '?') {
-          status = 'unknown';
-          message = '尚未标注平仄';
-        } else if (expected === '中') {
-          status = 'correct';
-          message = '可平可仄';
-        } else if (actual === expected) {
-          status = 'correct';
-          message = '合律';
-        } else if (this.isAcceptableVariant(template, lineIndex, position)) {
-          status = 'variant';
-          message = '一三五位置的可接受变体';
-        } else {
-          status = 'error';
-          message = `此处应为${expected}声`;
-        }
-        return { char, position, expected, actual, status, message, mark };
-      });
-      const rhymeChars = template.rhymeLines.includes(lineIndex) ? cells.slice(-1).map((cell) => cell.char) : [];
-      return {
-        index: lineIndex,
-        cells,
-        rhymeChars,
-        errors: cells.filter((cell) => cell.status === 'error').length,
-        variants: cells.filter((cell) => cell.status === 'variant').length,
-      };
+    const byIndex = new Map(snapshot?.lines.map((line) => [line.index, line]) ?? []);
+    return rawLines.map((raw, index) => {
+      const analyzed = byIndex.get(index);
+      const chars = Array.from(raw).filter((char) => !PUNCTUATION.has(char));
+      const fingerprint = this.lineFingerprint(chars, marks, index, template.id);
+      if (analyzed && this.fingerprintOf(analyzed, index, template.id) === fingerprint) {
+        return { index, confirmed: true, source: analyzed };
+      }
+      return { index, confirmed: false, source: this.pendingLine(chars, index) };
     });
   });
 
+  /** 仅包含已确认且与正文一致的行；未算完的行不出任何结论。 */
+  readonly analysis = computed<AnalysisLine[]>(() => this.viewLines().filter((line) => line.confirmed).map((line) => line.source));
+
   readonly issues = computed<PoemIssue[]>(() => {
-    const analysis = this.analysis();
-    const version = this.activeVersion();
-    const template = this.template();
-    const issues: PoemIssue[] = [];
-    analysis.forEach((line) => {
-      line.cells.filter((cell) => cell.status === 'error').forEach((cell) => {
-        issues.push({
-          id: uid('issue'),
-          level: 'error',
-          title: '出律位置',
-          detail: `第 ${line.index + 1} 句“${cell.char}”：${cell.message}`,
-          line: line.index,
-          position: cell.position,
-        });
+    this.editEpoch();
+    const snapshot = this.confirmedSnapshot();
+    const pendingCount = this.viewLines().filter((line) => !line.confirmed).length;
+    if (!snapshot) {
+      return [
+        { id: 'analysis-pending-all', level: 'info', title: '待分析', detail: '正文尚未完成后台分析，暂无格律结论。' },
+        ...this.antithesisIssues(),
+      ];
+    }
+    const issues = snapshot.issues.filter((issue) => issue.line === undefined || this.viewLines()[issue.line]?.confirmed);
+    if (pendingCount > 0) {
+      issues.unshift({
+        id: 'analysis-pending',
+        level: 'warning',
+        title: '部分段落待分析',
+        detail: `还有 ${pendingCount} 句未纳入当前已确认分析版本，以下结论仅覆盖已算完段落。`,
       });
-      if (line.cells.some((cell) => cell.status === 'unknown')) {
-        issues.push({ id: uid('issue'), level: 'warning', title: '存在未标注字', detail: `第 ${line.index + 1} 句仍有平仄未确认。`, line: line.index });
-      }
-    });
-    const rhymeCells = template.rhymeLines.map((line) => analysis[line]?.cells.at(-1)).filter(Boolean);
-    const rhymeGroups = new Map<string, string[]>();
-    rhymeCells.forEach((cell) => {
-      if (!cell?.mark.rhyme) {
-        issues.push({ id: uid('issue'), level: 'warning', title: '韵脚缺少韵部', detail: `第 ${(cell?.position ?? 0) + 1} 句末字尚未指定韵部。` });
-        return;
-      }
-      rhymeGroups.set(cell.mark.rhyme, [...(rhymeGroups.get(cell.mark.rhyme) ?? []), cell.char]);
-    });
-    rhymeGroups.forEach((chars, rhyme) => {
-      const duplicate = chars.find((char, index) => chars.indexOf(char) !== index);
-      if (duplicate) issues.push({ id: uid('issue'), level: 'warning', title: '重复用韵', detail: `韵部 ${rhyme} 重复使用末字“${duplicate}”。` });
-    });
-    if (version.antithesisPairs.length === 0) {
-      issues.push({ id: 'antithesis-empty', level: 'info', title: '尚未标记对仗', detail: '可在检视器中把两句建立对仗关系。' });
     }
-    if (!issues.some((issue) => issue.level === 'error')) {
-      issues.unshift({ id: 'meter-ok', level: 'info', title: '格律检查通过', detail: '当前未发现硬性出律，请继续核对可接受变体。' });
-    }
+    issues.push(...this.antithesisIssues());
     return issues;
   });
 
-  readonly diff = computed<CharDiff[]>(() => {
-    const left = this.workspace().versions.find((version) => version.id === this.baselineVersionId());
-    const right = this.activeVersion();
-    if (!left || left.id === right.id) return [];
-    const leftChars = Array.from(left.text.replace(/\n/g, ''));
-    const rightChars = Array.from(right.text.replace(/\n/g, ''));
-    const size = Math.max(leftChars.length, rightChars.length);
-    return Array.from({ length: size }, (_, index) => ({
-      index,
-      left: leftChars[index] ?? '',
-      right: rightChars[index] ?? '',
-      changed: leftChars[index] !== rightChars[index],
-    }));
+  private antithesisIssues(): PoemIssue[] {
+    if (this.activeVersion().antithesisPairs.length > 0) return [];
+    return [{ id: 'antithesis-empty', level: 'info', title: '尚未标记对仗', detail: '可在检视器中把两句建立对仗关系。' }];
+  }
+
+  readonly confirmedLineCount = computed(() => this.viewLines().filter((line) => line.confirmed).length);
+
+  /** 当前选中字格：已确认行展示分析结论，待分析行展示占位，输入与批注照常可用。 */
+  selectedCell() {
+    const view = this.viewLines()[this.selectedLine()];
+    return view?.source.cells[this.selectedPosition()];
+  }
+
+  // ---------------------------------------------------------------------------
+  // 异文对照：两侧都必须来自各自的已确认分析版本，否则不显示旧结论
+  // ---------------------------------------------------------------------------
+
+  readonly baselineVersion = computed(() => {
+    this.editEpoch();
+    return this.workspace().versions.find((version) => version.id === this.baselineVersionId());
   });
 
-  readonly differences = computed(() => this.diff().filter((item) => item.changed).map((item) => item.index));
-  readonly baselineVersion = computed(() => this.workspace().versions.find((version) => version.id === this.baselineVersionId()));
+  private snapshotOf(versionId: string): AnalysisSnapshot | undefined {
+    const snapshot = this.engine.snapshot(versionId);
+    return snapshot && snapshot.templateId === this.workspace().templateId ? snapshot : undefined;
+  }
+
+  readonly diffReady = computed<boolean>(() => {
+    this.editEpoch();
+    const baseline = this.baselineVersion();
+    if (!baseline) return false;
+    const active = this.activeVersion();
+    if (baseline.id === active.id) return false;
+    const left = this.snapshotOf(baseline.id);
+    const right = this.snapshotOf(active.id);
+    return !!left && !!right && left.text === baseline.text && right.text === active.text;
+  });
+
+  readonly diffLines = computed<DiffLine[]>(() => {
+    this.editEpoch();
+    const baseline = this.baselineVersion();
+    const active = this.activeVersion();
+    if (!baseline || baseline.id === active.id) return [];
+    const leftSnapshot = this.snapshotOf(baseline.id);
+    const rightSnapshot = this.snapshotOf(active.id);
+    if (!leftSnapshot || !rightSnapshot || leftSnapshot.text !== baseline.text || rightSnapshot.text !== active.text) return [];
+    const leftRaw = leftSnapshot.text.split('\n');
+    const rightRaw = rightSnapshot.text.split('\n');
+    const size = Math.max(leftRaw.length, rightRaw.length);
+    return Array.from({ length: size }, (_, line) => {
+      const lChars = Array.from(leftRaw[line] ?? '').filter((char) => !PUNCTUATION.has(char));
+      const rChars = Array.from(rightRaw[line] ?? '').filter((char) => !PUNCTUATION.has(char));
+      const width = Math.max(lChars.length, rChars.length);
+      const cells: DiffCell[] = Array.from({ length: width }, (_, position) => ({
+        left: lChars[position] ?? '',
+        right: rChars[position] ?? '',
+        changed: (lChars[position] ?? '') !== (rChars[position] ?? ''),
+      }));
+      return { line, left: leftRaw[line] ?? '', right: rightRaw[line] ?? '', changed: cells.some((cell) => cell.changed), cells };
+    });
+  });
+
+  readonly differenceLines = computed(() => this.diffLines().filter((line) => line.changed).map((line) => line.line));
+
+  // ---------------------------------------------------------------------------
+  // 编辑动作
+  // ---------------------------------------------------------------------------
 
   selectVersion(id: string): void {
+    if (id === this.workspace().activeVersionId) return;
     this.workspace.update((workspace) => ({ ...workspace, activeVersionId: id }));
+    this.selectedLine.set(0);
+    this.selectedPosition.set(0);
+    this.currentDiffLine.set(0);
+    this.editEpoch.update((n) => n + 1);
+    this.ensureAnalysis();
   }
 
   selectCell(line: number, position: number): void {
@@ -263,16 +360,28 @@ export class PoetryStoreService {
   }
 
   setTemplate(id: string): void {
-    this.commit((workspace) => {
-      workspace.templateId = id;
-    });
+    this.commit(
+      (workspace) => {
+        workspace.templateId = id;
+      },
+      { coalesceKey: null },
+    );
+    this.ensureAnalysis();
   }
 
   updateText(text: string): void {
-    this.commit((workspace) => {
-      const version = this.versionIn(workspace);
-      version.text = text;
-    });
+    const now = Date.now();
+    const withinWindow = now - this.lastTextEditAt < TEXT_UNDO_COALESCE_MS;
+    // 同一连续输入段共用一个随段落递增的合并键，第一键与后续键都参与合并。
+    if (!withinWindow) this.textCoalesceSeq += 1;
+    this.lastTextEditAt = now;
+    this.commit(
+      (workspace) => {
+        this.versionIn(workspace).text = text;
+      },
+      { coalesceKey: `text-${this.textCoalesceSeq}` },
+    );
+    this.invalidateActiveAnalysis();
   }
 
   updateTitle(title: string): void {
@@ -290,9 +399,10 @@ export class PoetryStoreService {
   setMark(patch: Partial<CharacterMark>): void {
     this.commit((workspace) => {
       const version = this.versionIn(workspace);
-      const id = key(this.selectedLine(), this.selectedPosition());
+      const id = keyOf(this.selectedLine(), this.selectedPosition());
       version.marks[id] = { ...defaultMark(), ...version.marks[id], ...patch };
     });
+    this.invalidateActiveAnalysis();
   }
 
   cycleTone(): void {
@@ -347,6 +457,7 @@ export class PoetryStoreService {
       workspace.activeVersionId = active.id;
     });
     this.toast.set('已建立独立校勘稿');
+    this.ensureAnalysis();
   }
 
   duplicateActiveAsBaseline(): void {
@@ -354,48 +465,91 @@ export class PoetryStoreService {
   }
 
   nextDifference(): void {
-    const values = this.differences();
+    const values = this.differenceLines();
     if (!values.length) return;
-    const current = values.findIndex((index) => index >= this.currentDiffIndex());
-    this.currentDiffIndex.set(values[(current + 1) % values.length]);
+    const current = values.findIndex((index) => index > this.currentDiffLine());
+    this.currentDiffLine.set(values[current === -1 ? 0 : current]);
   }
 
   previousDifference(): void {
-    const values = this.differences();
+    const values = this.differenceLines();
     if (!values.length) return;
     const reverse = [...values].reverse();
-    const current = reverse.findIndex((index) => index <= this.currentDiffIndex());
-    this.currentDiffIndex.set(reverse[(current + 1) % reverse.length]);
+    const current = reverse.findIndex((index) => index < this.currentDiffLine());
+    this.currentDiffLine.set(reverse[current === -1 ? 0 : current]);
+  }
+
+  retryAnalysis(): void {
+    this.engine.resume(this.activeVersion().id);
+  }
+
+  runAnalysisNow(): void {
+    const timer = this.analyzeTimers.get(this.activeVersion().id);
+    if (timer) clearTimeout(timer);
+    this.engine.request(this.activeVersion().id);
+  }
+
+  ensureVersionAnalyzed(versionId: string): void {
+    if (versionId === this.activeVersion().id) {
+      this.ensureAnalysis(versionId);
+      return;
+    }
+    // 底本等非当前版本：无已确认结果时排队后台分析，不打断正在编辑的会话。
+    if (!this.engine.snapshot(versionId)) this.engine.request(versionId);
   }
 
   undo(): void {
     const previous = this.undoStack.pop();
     if (!previous) return;
-    this.redoStack.push(clone(this.workspace()));
-    this.workspace.set(previous);
-    this.undoCount.set(this.undoStack.length);
-    this.redoCount.set(this.redoStack.length);
+    this.redoStack.push(this.historyEntry());
+    this.workspace.set(previous.workspace);
+    this.syncHistoryCounts();
     this.persist();
+    this.invalidateActiveAnalysis();
   }
 
   redo(): void {
     const next = this.redoStack.pop();
     if (!next) return;
-    this.undoStack.push(clone(this.workspace()));
-    this.workspace.set(next);
-    this.undoCount.set(this.undoStack.length);
-    this.redoCount.set(this.redoStack.length);
+    this.undoStack.push(this.historyEntry());
+    this.workspace.set(next.workspace);
+    this.syncHistoryCounts();
     this.persist();
+    this.invalidateActiveAnalysis();
   }
+
+  // ---------------------------------------------------------------------------
+  // 导出校对稿：逐段标注“已算完 / 待分析”，未算完不附任何旧结论
+  // ---------------------------------------------------------------------------
 
   exportProofreadCopy(): string {
     const active = this.activeVersion();
-    const lines = this.analysis().map((line) => {
-      const tags = line.cells.map((cell) => `${cell.char}${cell.actual === '?' ? '□' : `(${cell.actual})`}`).join(' ');
-      return `第 ${line.index + 1} 句：${tags}`;
+    const viewLines = this.viewLines();
+    const lines = viewLines.map((view) => {
+      if (!view.confirmed) {
+        return `第 ${view.index + 1} 句：待分析（正文：${this.lines()[view.index]}）`;
+      }
+      const tags = view.source.cells
+        .map((cell) => `${cell.char}${cell.actual === '?' ? '□' : `(${cell.actual})`}`)
+        .join(' ');
+      return `第 ${view.index + 1} 句〔已算完〕：${tags}`;
     });
+    const snapshot = this.confirmedSnapshot();
     const notes = this.issues().map((issue) => `[${issue.level.toUpperCase()}] ${issue.title}：${issue.detail}`);
-    return [`# ${this.workspace().title} · 格律校对稿`, '', `底本：${active.name}`, `出处：${active.source}`, '', '## 字音标注', ...lines, '', '## 检查记录', ...notes].join('\n');
+    return [
+      `# ${this.workspace().title} · 格律校对稿`,
+      '',
+      `底本：${active.name}`,
+      `出处：${active.source}`,
+      `分析版本：${snapshot ? new Date(snapshot.analyzedAt).toLocaleString() : '尚无已确认分析版本'}`,
+      `覆盖范围：${this.confirmedLineCount()} / ${viewLines.length} 句已算完，其余标注“待分析”`,
+      '',
+      '## 字音标注',
+      ...lines,
+      '',
+      '## 检查记录',
+      ...notes,
+    ].join('\n');
   }
 
   downloadProofreadCopy(): void {
@@ -406,34 +560,120 @@ export class PoetryStoreService {
     URL.revokeObjectURL(anchor.href);
   }
 
-  selectedCell(): AnalysisCell | undefined {
-    return this.analysis()[this.selectedLine()]?.cells[this.selectedPosition()];
+  // ---------------------------------------------------------------------------
+  // 内部：编辑/分析分离的关键
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 编辑使当前版本在途批次立即作废：输入和批注继续可用，
+   * 已确认版本在引擎中保留（失败回滚靠它），但视图按行指纹自行遮蔽过时结论。
+   */
+  private invalidateActiveAnalysis(): void {
+    const versionId = this.activeVersion().id;
+    this.engine.invalidate(versionId);
+    this.editEpoch.update((n) => n + 1);
+    this.scheduleAnalysis(versionId);
   }
 
-  private commit(mutator: (workspace: PoemWorkspace) => void): void {
-    this.undoStack.push(clone(this.workspace()));
-    if (this.undoStack.length > 80) this.undoStack.shift();
+  private ensureAnalysis(versionId?: string): void {
+    this.editEpoch.update((n) => n + 1);
+    this.scheduleAnalysis(versionId ?? this.workspace().activeVersionId);
+  }
+
+  /** 后台计时与批次调度全部留在 Angular 区域外，只靠 signal 通知界面。 */
+  private scheduleAnalysis(versionId: string): void {
+    if (this.analyzeTimers.get(versionId)) clearTimeout(this.analyzeTimers.get(versionId));
+    this.zone.runOutsideAngular(() => {
+      const timer = setTimeout(() => this.engine.request(versionId), ANALYZE_DEBOUNCE_MS);
+      this.analyzeTimers.set(versionId, timer);
+    });
+  }
+
+  private queueFailedResumes(): void {
+    this.workspace().versions.forEach((version) => {
+      if (this.engine.runState(version.id).phase === 'failed') this.engine.resume(version.id);
+    });
+  }
+
+  private pendingLine(chars: string[], lineIndex: number): AnalysisLine {
+    const cells = chars.map((char, position) => ({
+      char,
+      position,
+      expected: '中' as Tone,
+      actual: '?' as Tone,
+      status: 'pending' as const,
+      message: '此段尚未分析完成，暂无格律结论',
+      mark: this.activeVersion().marks[keyOf(lineIndex, position)] ?? defaultMark(),
+    }));
+    return { index: lineIndex, cells, rhymeChars: [], errors: 0, variants: 0 };
+  }
+
+  private lineFingerprint(chars: string[], marks: Record<string, CharacterMark>, line: number, templateId: string): string {
+    const markPart = chars.map((_, position) => JSON.stringify(marks[keyOf(line, position)] ?? defaultMark())).join('|');
+    return `${templateId}|${chars.join('')}|${markPart}`;
+  }
+
+  private fingerprintOf(line: AnalysisLine, index: number, templateId: string): string {
+    const chars = line.cells.map((cell) => cell.char);
+    const marks = Object.fromEntries(line.cells.map((cell) => [keyOf(index, cell.position), cell.mark]));
+    return this.lineFingerprint(chars, marks, index, templateId);
+  }
+
+  private historyEntry(): HistoryEntry {
+    return { workspace: clone(this.workspace()), coalesceKey: null };
+  }
+
+  private commit(mutator: (workspace: PoemWorkspace) => void, options: { coalesceKey?: string | null } = {}): void {
+    const coalesce = options.coalesceKey !== undefined && options.coalesceKey !== null;
+    const top = this.undoStack[this.undoStack.length - 1];
+    if (!(coalesce && top?.coalesceKey === options.coalesceKey)) {
+      // 保留本次提交前的完整快照；同一合并段只入栈一次，撤销时回到输入起点。
+      this.undoStack.push({ workspace: clone(this.workspace()), coalesceKey: options.coalesceKey ?? null });
+      if (this.undoStack.length > 80) this.undoStack.shift();
+    }
     this.redoStack = [];
     const next = clone(this.workspace());
     mutator(next);
     next.updatedAt = new Date().toISOString();
     this.workspace.set(next);
-    this.undoCount.set(this.undoStack.length);
-    this.redoCount.set(0);
-    this.persist();
+    this.syncHistoryCounts();
+    this.schedulePersist();
   }
 
-  private versionIn(workspace: PoemWorkspace): PoemVersion {
-    const version = workspace.versions.find((item) => item.id === workspace.activeVersionId) ?? workspace.versions[0];
-    return version;
+  private syncHistoryCounts(): void {
+    this.undoCount.set(this.undoStack.length);
+    this.redoCount.set(this.redoStack.length);
+  }
+
+  private schedulePersist(): void {
+    if (this.persistTimer) clearTimeout(this.persistTimer);
+    this.zone.runOutsideAngular(() => {
+      this.persistTimer = setTimeout(() => this.persistNow(), PERSIST_DEBOUNCE_MS);
+    });
+  }
+
+  private persistNow(): void {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.workspace()));
+    } catch {
+      /* 存储失败不阻塞编辑 */
+    }
   }
 
   private persist(): void {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(this.workspace()));
+    this.persistNow();
   }
 
-  private isAcceptableVariant(template: MeterTemplate, line: number, position: number): boolean {
-    if (template.lineLength === 5) return position === 0 || position === 2;
-    return position === 0 || position === 2 || position === 4;
+  private versionIn(workspace: PoemWorkspace): PoemVersion {
+    return workspace.versions.find((item) => item.id === workspace.activeVersionId) ?? workspace.versions[0];
   }
+}
+
+interface HistoryEntry {
+  workspace: PoemWorkspace;
+  coalesceKey: string | null;
 }
